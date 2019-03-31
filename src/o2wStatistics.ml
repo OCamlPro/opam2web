@@ -23,6 +23,7 @@ module StrS = OpamStd.String.Set
 module IntM = OpamStd.IntMap
 module OPM  = OpamPackage.Map
 module HashM = OpamHash.Map
+module Cache = O2wCache
 module FloM =
   OpamStd.Map.Make (struct
     type t = float
@@ -262,9 +263,114 @@ let add_mcache_entry mcache entry =
     IntM.add d dmcache mcache
   | None -> mcache
 
+(* Package Dependencies cache: package ->  (dependencies set * opam file). Opam
+   file is stored to be able to detect updates *)
+type dependencies_cache = ( OpamFile.OPAM.t * OpamPackage.Name.Set.t) OpamPackage.Map.t
+let dependencies_cache : dependencies_cache Cache.t =
+  Cache.cache ~version:1 "~/.cache/opam2web2/dependencies_cache" OPM.empty
+
+let dependencies st =
+  Printf.printf "Universe...%!";
+  let timer = OpamConsole.timer () in
+  let universe =
+    OpamSwitchState.universe st
+      ~requested:(OpamPackage.names_of_packages st.packages) Query
+  in
+  let depopts = true in
+  let build = true in
+  let post = true in
+  let vm = OpamSolver.cudf_versions_map universe st.packages in
+  let cudf_universe =
+    OpamSolver.load_cudf_universe ~depopts ~build ~post ~version_map:vm
+      universe st.packages ()
+  in
+  let graph =
+    Cudf.get_packages cudf_universe
+    |> Cudf.load_universe
+    |> OpamCudf.Graph.of_universe
+  in
+  Printf.printf "loaded in %.3fs\n%!" (timer());
+  let opam2cudf nv =
+    let p =
+      { Cudf.default_package with
+        Cudf.package = Common.CudfAdd.encode (OpamPackage.name_to_string nv);
+        pkg_extra = [
+          OpamCudf.s_source, `String(OpamPackage.name_to_string nv);
+          OpamCudf.s_source_number, `String(OpamPackage.version_to_string nv);
+        ];
+      } in
+    match OpamPackage.Map.find_opt nv vm with
+    | Some version -> { p with Cudf.version }
+    | None -> p
+  in
+  fun package ->
+    (** translate opam package to cupdf packages here *)
+    let package = opam2cudf package in
+    let subgraph =
+      OpamCudf.(Graph.close_and_linearize graph (Set.singleton package))
+    in
+    List.rev_map OpamCudf.cudf2opam subgraph
+
+(* Get dependencies functions *)
+let get_deps deps st pkg env =
+  try
+    let opam0, pl = OpamPackage.Map.find pkg env in
+    match OpamSwitchState.opam_opt st pkg with
+    | Some opam when OpamFile.OPAM.effectively_equal opam0 opam ->
+      env, pl
+    | _ -> deps pkg env st
+  with Not_found -> deps pkg env st
+
+let full_deps dependencies =
+  get_deps @@ (fun pkg env st ->
+      let deps =
+        pkg
+        |> dependencies
+        |> OpamPackage.Set.of_list
+        |> OpamPackage.names_of_packages
+        |> OpamPackage.Name.Set.remove (OpamPackage.name pkg)
+      in
+      let opam =
+        OpamStd.Option.default OpamFile.OPAM.empty
+          (OpamSwitchState.opam_opt st pkg)
+      in
+      OpamPackage.Map.add pkg (opam, deps) env, deps)
+
+let opam_deps =
+  get_deps @@ (fun pkg env st ->
+      let opam, deps =
+        match OpamSwitchState.opam_opt st pkg with
+        | Some op ->
+          let d =
+            let add form set =
+              OpamFormula.fold_left
+                (fun acc (n,_) -> OpamPackage.Name.Set.add n acc) set form
+            in
+            add (OpamFile.OPAM.depends op) OpamPackage.Name.Set.empty
+            |> add (OpamFile.OPAM.depopts op)
+          in
+          op,d
+        | None -> OpamFile.OPAM.empty, OpamPackage.Name.Set.empty
+      in
+      OpamPackage.Map.add pkg (opam, deps) env, deps)
+
+let generate_dependencies_cache repos =
+  let st = O2wUniverse.load_opam_state repos in
+  let dpc = Cache.read_cache dependencies_cache  in
+  let dependencies = dependencies st in
+  let timer = OpamConsole.timer () in
+  let ndpc =
+    OpamPackage.Set.fold (fun p e -> fst (full_deps dependencies st p e)) st.packages dpc
+  in
+  Printf.printf "I have %d elements, %d are new (%.3fs)\n"
+    (OPM.cardinal ndpc)
+    (OPM.cardinal ndpc - OPM.cardinal dpc)
+    (timer ());
+  Cache.write_cache ndpc dependencies_cache
+
 let compute_stats ?(unique=false) mcache st =
   (* timestamps: Compute once a map of packages to keep, by user, detect leaf
-      package given download timestamps: adjacent downloads < 5 min  *)
+      package given download timestamps: adjacent downloads < 2 min  *)
   let month_leaf_pkg_stats =
     let flat =
       IntM.fold
@@ -277,35 +383,14 @@ let compute_stats ?(unique=false) mcache st =
           StrM.fold (fun str tsl map2 ->
               let map = try StrM.find str map2 with Not_found -> FloM.empty in
               let tsm = List.fold_left
-                  (fun map3 ts -> FloM.update ts (fun l -> pkg::l) []  map3)
+                  (fun map3 ts ->
+                     FloM.update ts
+                       (fun l -> OpamPackage.Set.add pkg l)
+                       OpamPackage.Set.empty map3)
                   map tsl in
               StrM.add str tsm map2
             ) strm map1
         ) flat StrM.empty
-    in
-    let get_package_deps env p =
-      let n = OpamPackage.name p in
-      try env, OpamPackage.Name.Map.find n env
-      with Not_found ->
-        let deps =
-          match OpamSwitchState.opam_opt st p with
-          | Some op ->
-            OpamFormula.fold_left (fun acc (n,_) -> n::acc) []
-              (OpamFile.OPAM.depends op)
-          | None -> []
-        in (OpamPackage.Name.Map.add n deps env), deps
-    in
-    let get_dependencies_set adjacent env =
-      let module OPS = OpamPackage.Name.Set in
-      FloM.fold (fun _ p (env, deps) ->
-          let n_env, ldeps =
-            List.fold_left
-              (fun (acc_env, acc_d) pi ->
-                 let e,d = get_package_deps acc_env pi in
-                 e,d::acc_d) (env,[]) p
-          in
-          n_env, OPS.union deps (OPS.of_list (List.flatten ldeps)))
-        adjacent (env, OPS.empty)
     in
     (* split map into first adjacent set (first dead window of 2 min)
        and rest *)
@@ -327,34 +412,69 @@ let compute_stats ?(unique=false) mcache st =
       | m1, Some pl, m2 -> (FloM.add split_ts pl m1), m2
       | m1, None, m2 -> assert false (* we are sure that the element exists*)
     in
-    let _, pkg_to_keep =
-      (* Create leaf packages map, by user *)
-      StrM.fold (fun h tsm (env, tsm_acc) ->
-          let rec aux tsm (env, n_tsm_acc) =
-            if FloM.is_empty tsm then (env, n_tsm_acc)
-            else
-            (* Get adjacent download map, and filter by package
-               dependencies: keep leaf only *)
-            let adjacent, others = get_adjacent tsm in
-            let n_env, all_deps = get_dependencies_set adjacent env in
-            let n_tsm =
-              FloM.union List.append n_tsm_acc @@
-              FloM.fold (fun ts pl acc ->
-                  let flt =
-                    List.filter
-                      (fun p ->
-                         not (OpamPackage.Name.Set.mem
-                                (OpamPackage.name p) all_deps)) pl
-                  in
-                  if flt <> [] then FloM.add ts flt acc else acc)
-                adjacent FloM.empty
-            in
-            aux others (n_env,n_tsm)
-          in
-          let n_env, new_binding = aux tsm (env, FloM.empty) in
-          n_env, StrM.add h new_binding tsm_acc
-        ) timestamps (OpamPackage.Name.Map.empty, StrM.empty)
+    let env, cudf_dependencies =
+      let c = Cache.read_cache dependencies_cache in
+      c, (not(OPM.is_empty c))
     in
+    (* Du to the cost of retrieving all packages graph dependencies, a choice
+       is done on dependencies retrieving. If dependencies cache exists, uses it,
+       otherwise calculate using opam file dependencies. *)
+    let get_package_deps =
+      if cudf_dependencies then
+        (Printf.printf "Existing cache, use all dependencies (cudf graph)\n";
+          full_deps (dependencies st) st)
+         else
+        (Printf.printf "No dependencies cache found, use only opam file dependencies\n";
+        opam_deps st)
+    in
+    let get_dependencies_set adjacent env =
+      let open OpamPackage.Name.Set.Op in
+      FloM.fold (fun _ p (env, deps) ->
+          let n_env, ldeps =
+            OpamPackage.Set.fold
+              (fun pi (acc_env, acc_d) ->
+                 let e,d = get_package_deps pi acc_env in
+                 e, d ++ acc_d) p (env,OpamPackage.Name.Set.empty)
+          in
+          n_env, deps ++ ldeps)
+        adjacent (env, OpamPackage.Name.Set.empty)
+    in
+    let env, pkg_to_keep =
+      (* Create leaf packages map, by user *)
+        StrM.fold (fun h tsm (env, tsm_acc) ->
+            let rec aux tsm (env, n_tsm_acc) =
+              if FloM.is_empty tsm then (env, n_tsm_acc)
+              else
+                (* Get adjacent download map, and filter by package
+                   dependencies: keep leaf only *)
+                let adjacent, others = get_adjacent tsm in
+                let n_env, all_deps = get_dependencies_set adjacent env in
+                let newf =
+                  FloM.fold (fun ts pl acc ->
+                      let flt =
+                        OpamPackage.Set.filter
+                          (fun p ->
+                             not (OpamPackage.Name.Set.mem (OpamPackage.name p)
+                                    all_deps)) pl
+                      in
+                      if OpamPackage.Set.is_empty flt then
+                        acc
+                      else
+                        FloM.add ts flt acc)
+                    adjacent FloM.empty
+                in
+                let n_tsm =
+                  FloM.union OpamPackage.Set.union n_tsm_acc @@
+                  newf
+                in
+                aux others (n_env,n_tsm)
+            in
+            let n_env, new_binding = aux tsm (env, FloM.empty) in
+            n_env, StrM.add h new_binding tsm_acc
+          ) timestamps (env, StrM.empty)
+    in
+    if cudf_dependencies then
+        Cache.write_cache env dependencies_cache;
     let flat_pkgs_map =
       OPM.mapi (fun pkg strm ->
           StrM.mapi (fun host tsl ->
@@ -364,13 +484,15 @@ let compute_stats ?(unique=false) mcache st =
               in
               let lst =
                 List.filter (fun ts ->
-                    try List.mem pkg (FloM.find ts pkg_user)
+                    try OpamPackage.Set.mem pkg (FloM.find ts pkg_user)
                     with Not_found -> false
                   ) tsl
               in
               Int64.of_int (List.length lst))
-            strm)
+            strm
+          |> StrM.filter (fun _ i -> i <> 0L))
         flat
+      |> OPM.filter (fun _ strm -> not(StrM.is_empty strm))
     in
     let add _ n acc =
       if unique then
@@ -379,6 +501,7 @@ let compute_stats ?(unique=false) mcache st =
     in
     OPM.map (fun str -> StrM.fold add str Int64.zero) flat_pkgs_map
   in
+
   (* Compute stats given in interval set *)
   let compute_in interval =
     let users_stats =
@@ -410,6 +533,7 @@ let compute_stats ?(unique=false) mcache st =
         if unique then
           if n <> [] then Int64.succ acc else acc
         else Int64.add (Int64.of_int (List.length n)) acc
+        (* we keep user duplication for packages *)
       in
       OPM.map (fun str -> StrM.fold add str Int64.zero) flat_pkgs_map
     in
@@ -437,9 +561,14 @@ let compute_stats ?(unique=false) mcache st =
     else compute_in map
   in
   let month_stats = compute_in mcache in
-  (* do not compute altime stats *)
+  (* do not compute alltime stats *)
   let alltime_stats = empty_stats in
-  { alltime_stats; day_stats; week_stats; month_stats; month_leaf_pkg_stats; hash_pkgs_map=StrM.empty }
+  { alltime_stats;
+    day_stats;
+    week_stats;
+    month_stats;
+    month_leaf_pkg_stats;
+    hash_pkgs_map=StrM.empty }
 
 let add_mcache =
   IntM.union
@@ -456,36 +585,10 @@ type cache_elt = {
   cache_month_map: mcache;
   cache_only_since: float;
 }
-type cache = cache_elt OpamFilename.Map.t
-let cache_file = OpamFilename.of_string "~/.cache/opam2web2/stats_cache"
-let cache_format_version = 3
-let version_id =
-  Digest.string (OpamVersion.(to_string (full ())) ^" "^
-                 string_of_int cache_format_version)
-let write_cache (cache: cache) =
-  OpamFilename.mkdir (OpamFilename.dirname cache_file);
-  let oc = open_out_bin (OpamFilename.to_string cache_file) in
-  Digest.output oc version_id;
-  Marshal.to_channel oc cache [];
-  close_out oc
-let read_cache () : cache =
-  try
-    let ic = open_in_bin (OpamFilename.to_string cache_file) in
-    let cache =
-      if Digest.input ic = version_id then
-        (Printf.printf "Reading logs cache from %s... %!"
-           (OpamFilename.to_string cache_file);
-         let c = Marshal.from_channel ic in
-         Printf.printf "done.\n%!";
-         c)
-      else
-        (Printf.printf "Skipping mismatching logs cache %s\n%!"
-           (OpamFilename.to_string cache_file);
-         OpamFilename.Map.empty)
-    in
-    close_in ic;
-    cache
-  with _ -> OpamFilename.Map.empty
+type log_cache = cache_elt OpamFilename.Map.t
+let log_cache : log_cache Cache.t =
+  Cache.cache ~version:3 "~/.cache/opam2web2/stats_cache" OpamFilename.Map.empty
+
 let partial_digest ic len =
   seek_in ic 0;
   let len = max 10_000 len in
@@ -493,7 +596,7 @@ let partial_digest ic len =
     Digest.channel ic (-1)
 
 let statistics_set files repos =
-  let cache = read_cache () in
+  let cache = Cache.read_cache log_cache in
   let skip_before = two_months_ago in
   let cache =
     OpamFilename.Map.filter (fun f _ -> List.mem f files) cache
@@ -577,7 +680,7 @@ let statistics_set files repos =
       else
         read_and_mcache mcache l
     in
-    let cache,mcache =
+    let new_cache, mcache =
       List.fold_left (fun (cache, sbglob) (file,(mcache, log)) ->
           let mcache = read_and_mcache mcache log in
           let ic = open_in (OpamFilename.to_string file) in
@@ -595,7 +698,7 @@ let statistics_set files repos =
         (cache, empty_mcache)
         mc_and_logs
     in
-    write_cache cache;
+    Cache.write_cache new_cache log_cache;
     let stats = compute_stats ~unique:O2wGlobals.default_log_filter.log_per_ip mcache st in
     let hash_pkgs_map =
       StrM.filter (fun _ (p,s) -> not (OpamPackage.Set.is_empty s)) hash_map

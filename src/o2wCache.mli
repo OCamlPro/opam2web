@@ -1,6 +1,6 @@
 (**************************************************************************)
 (*                                                                        *)
-(*    Copyright 2012-2013 OCamlPro                                        *)
+(*    Copyright 2012-2018 OCamlPro                                        *)
 (*    Copyright 2012 INRIA                                                *)
 (*                                                                        *)
 (*  All rights reserved.This file is distributed under the terms of the   *)
@@ -14,23 +14,12 @@
 (*                                                                        *)
 (**************************************************************************)
 
-(** Statistics *)
+(** Caches *)
 
-open OpamTypes
-open O2wTypes
+type 'a t
 
-(** Generate statistics on log entries *)
-val statistics_set: filename list -> dirname list -> statistics_set option
+val cache: version:int -> string -> 'a -> 'a t
 
-(** Return the top packages *)
-val top_packages: ?ntop:int -> ?reverse:bool -> (package -> 'a) ->
-  package_set -> (package * 'a) list
+val write_cache: 'a -> 'a t -> unit
 
-(** Generate package dependencies cache of given repos *)
-val generate_dependencies_cache: dirname list -> unit
-
-(** Export the popularity list into CSV format *)
-val to_csv: int64 package_map -> string -> unit
-
-(** Export the popularity list into JSON format *)
-val to_json: int64 package_map -> string -> unit
+val read_cache: 'a t -> 'a
